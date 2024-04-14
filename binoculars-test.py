@@ -5,7 +5,10 @@ import torch
 import transformers
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
-from enum import Enum
+import accelerate
+from google.colab import drive
+
+
 
 
 #SETUPS
@@ -78,8 +81,88 @@ def assert_tokenizer_consistency(model_id_1, model_id_2):
     )
     if not identical_tokenizers:
         raise ValueError(f"Tokenizers are not identical for {model_id_1} and {model_id_2}.")
-    
+
 class Binoculars(object):
+    def __init__(self,
+                 observer_name_or_path: str = "tiiuae/falcon-7b",
+                 performer_name_or_path: str = "tiiuae/falcon-7b-instruct",
+                 use_bfloat16: bool = True,
+                 max_token_observed: int = 512,
+                 mode: str = "low-fpr",
+                 cache_dir: str = None,
+                 ) -> None:
+        assert_tokenizer_consistency(observer_name_or_path, performer_name_or_path)
+
+        self.change_mode(mode)
+
+        # Use the cache directory if provided
+        self.observer_model = AutoModelForCausalLM.from_pretrained(observer_name_or_path,
+                                                                   cache_dir=cache_dir,
+                                                                   device_map={"": DEVICE_1},
+                                                                   trust_remote_code=True,
+                                                                   torch_dtype=torch.bfloat16 if use_bfloat16
+                                                                   else torch.float32,
+                                                                   )
+        self.performer_model = AutoModelForCausalLM.from_pretrained(performer_name_or_path,
+                                                                    cache_dir=cache_dir,
+                                                                    device_map={"": DEVICE_2},
+                                                                    trust_remote_code=True,
+                                                                    torch_dtype=torch.bfloat16 if use_bfloat16
+                                                                    else torch.float32,
+                                                                    )
+        self.observer_model.eval()
+        self.performer_model.eval()
+
+        self.tokenizer = AutoTokenizer.from_pretrained(observer_name_or_path)
+        if not self.tokenizer.pad_token:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.max_token_observed = max_token_observed
+
+    def change_mode(self, mode: str) -> None:
+        if mode == "low-fpr":
+            self.threshold = BINOCULARS_FPR_THRESHOLD
+        elif mode == "accuracy":
+            self.threshold = BINOCULARS_ACCURACY_THRESHOLD
+        else:
+            raise ValueError(f"Invalid mode: {mode}")
+
+    def _tokenize(self, batch: list[str]) -> transformers.BatchEncoding:
+        batch_size = len(batch)
+        encodings = self.tokenizer(
+            batch,
+            return_tensors="pt",
+            padding="longest" if batch_size > 1 else False,
+            truncation=True,
+            max_length=self.max_token_observed,
+            return_token_type_ids=False).to(self.observer_model.device)
+        return encodings
+
+    @torch.inference_mode()
+    def _get_logits(self, encodings: transformers.BatchEncoding) -> torch.Tensor:
+        observer_logits = self.observer_model(**encodings.to(DEVICE_1)).logits
+        performer_logits = self.performer_model(**encodings.to(DEVICE_2)).logits
+        if DEVICE_1 != "cpu":
+            torch.cuda.synchronize()
+        return observer_logits, performer_logits
+
+    def compute_score(self, input_text: Union[list[str], str]) -> Union[float, list[float]]:
+        batch = [input_text] if isinstance(input_text, str) else input_text
+        encodings = self._tokenize(batch)
+        observer_logits, performer_logits = self._get_logits(encodings)
+        ppl = perplexity(encodings, performer_logits)
+        x_ppl = entropy(observer_logits.to(DEVICE_1), performer_logits.to(DEVICE_1),
+                        encodings.to(DEVICE_1), self.tokenizer.pad_token_id)
+        binoculars_scores = ppl / x_ppl
+        binoculars_scores = binoculars_scores.tolist()
+        return binoculars_scores[0] if isinstance(input_text, str) else binoculars_scores
+
+    def predict(self, input_text: Union[list[str], str]) -> Union[list[str], str]:
+        binoculars_scores = np.array(self.compute_score(input_text))
+        pred = np.where(binoculars_scores < self.threshold,
+                        "Most likely AI-generated",
+                        "Most likely human-generated"
+                        ).tolist()
+        return pred
     def __init__(self,
                  observer_name_or_path: str = "tiiuae/falcon-7b",
                  performer_name_or_path: str = "tiiuae/falcon-7b-instruct",
@@ -157,9 +240,11 @@ class Binoculars(object):
                         ).tolist()
         return pred
     
-def process(string):
-    #print(string)
-    return 1
+drive.mount('/content/drive')
+cache_directory = "/content/drive/My Drive/transformers_cache/"
+
+binoculars = Binoculars(cache_dir=cache_directory)
+
 
 def check_wikimia_dataset(dataset):
     seen_total = 0
@@ -168,7 +253,7 @@ def check_wikimia_dataset(dataset):
     unseen_quantity = 0
 
     for example in dataset:
-        binoculars_score = process(example['input'])
+        binoculars_score = binoculars.compute_score(example['snippet'])
         label = example['label']
         if label == 1:
             seen_total += binoculars_score
@@ -176,9 +261,9 @@ def check_wikimia_dataset(dataset):
         if label == 0:
             unseen_total += binoculars_score
             unseen_quantity += 1
-    print("Seen Average: " + (str(seen_total / seen_quantity) if seen_quantity != 0 else "Not Enough Quantity") + " with quantity " + str(seen_quantity))
-    print("Unseen Average: " + (str(unseen_total / unseen_quantity) if seen_quantity != 0 else "Not Enough Quantity") + " with quantity " + str(unseen_quantity))
-    
+        print("Seen Average: " + (str(seen_total / seen_quantity) if seen_quantity != 0 else "") + " with quantity " + str(seen_quantity))
+        print("Unseen Average: " + (str(unseen_total / unseen_quantity) if unseen_quantity != 0 else "") + " with quantity " + str(unseen_quantity))
+
 def merge_dataset(dataset):
     # Splitting the entries by label
     group_0 = [entry for entry in dataset if entry['label'] == 0]
@@ -186,19 +271,19 @@ def merge_dataset(dataset):
 
     # Determine the minimum length to ensure balanced pairs
     min_length = min(len(group_0), len(group_1))
-    
+
     # Create merged dataset
     merged_dataset = []
-    
+
     # 0 is unseen, 1 is seen
     group_0_index = 0
     group_1_index = 0
-    
 
-    
+
+
     unseen_mode = True
     seen_first_mode = True
-    
+
     while(group_0_index != len(group_0) and group_1_index != len(group_1)):
         if unseen_mode:
             string = group_0[group_0_index]['input']
@@ -221,8 +306,15 @@ def merge_dataset(dataset):
                 seen_first_mode = True
             unseen_mode = True
         merged_dataset.append({'input': string, 'label': (0 if not unseen_mode else 1 )})
-                
+
     return merged_dataset
+
+
+from datasets import load_dataset
+
+dataset = load_dataset("swj0419/BookMIA")
+check_wikimia_dataset(dataset['train'])
+
 
 
 
