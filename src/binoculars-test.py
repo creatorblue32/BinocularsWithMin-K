@@ -1,4 +1,8 @@
 #IMPORTS
+!pip install accelerate
+!pip install datasets
+!pip install tqdm
+
 from typing import Union
 import numpy as np
 import torch
@@ -7,6 +11,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
 import accelerate
 from google.colab import drive
+import pandas as pd
 
 
 
@@ -221,16 +226,38 @@ class Binoculars(object):
             torch.cuda.synchronize()
         return observer_logits, performer_logits
 
-    def compute_score(self, input_text: Union[list[str], str]) -> Union[float, list[float]]:
+    def compute_score(self, input_text):
         batch = [input_text] if isinstance(input_text, str) else input_text
         encodings = self._tokenize(batch)
         observer_logits, performer_logits = self._get_logits(encodings)
+
+        # Compute perplexity
         ppl = perplexity(encodings, performer_logits)
         x_ppl = entropy(observer_logits.to(DEVICE_1), performer_logits.to(DEVICE_1),
                         encodings.to(DEVICE_1), self.tokenizer.pad_token_id)
+
         binoculars_scores = ppl / x_ppl
         binoculars_scores = binoculars_scores.tolist()
-        return binoculars_scores[0] if isinstance(input_text, str) else binoculars_scores
+
+        # Now compute min-k probabilities
+        # Assuming you want to compute this for the performer model logits
+        min_k_probs = self.min_k_probabilities(performer_logits, encodings)
+
+        return binoculars_scores, min_k_probs
+
+    def min_k_probabilities(self, logits, encoding, ratios=[0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6]):
+        probabilities = torch.nn.functional.softmax(logits, dim=-1)
+        results = {}
+        for ratio in ratios:
+            k_length = int(len(encoding.input_ids[0]) * ratio)
+            if k_length == 0:
+                continue
+            actual_token_probs = probabilities[0, :len(encoding.input_ids[0]), :].gather(1, encoding.input_ids.unsqueeze(-1)).squeeze(-1)
+            sorted_probs = actual_token_probs.sort().values
+            min_k_probs = sorted_probs[:k_length]
+            results[f"Min_{int(ratio*100)}% Prob"] = -np.log(min_k_probs.mean()).item()
+        return results
+
 
     def predict(self, input_text: Union[list[str], str]) -> Union[list[str], str]:
         binoculars_scores = np.array(self.compute_score(input_text))
@@ -239,30 +266,30 @@ class Binoculars(object):
                         "Most likely human-generated"
                         ).tolist()
         return pred
-    
-drive.mount('/content/drive')
-cache_directory = "/content/drive/My Drive/transformers_cache/"
-
-binoculars = Binoculars(cache_dir=cache_directory)
-
 
 def check_wikimia_dataset(dataset):
     seen_total = 0
+    seen_mink = 0
     seen_quantity = 0
     unseen_total = 0
+    unseen_mink = 0
     unseen_quantity = 0
 
     for example in dataset:
-        binoculars_score = binoculars.compute_score(example['snippet'])
+        binoculars_score, minkprobs = binoculars.compute_score(example['input'])
         label = example['label']
         if label == 1:
             seen_total += binoculars_score
+            seen_mink += minkprobs
             seen_quantity += 1
         if label == 0:
             unseen_total += binoculars_score
+            unseen_mink += minkprobs
             unseen_quantity += 1
-        print("Seen Average: " + (str(seen_total / seen_quantity) if seen_quantity != 0 else "") + " with quantity " + str(seen_quantity))
-        print("Unseen Average: " + (str(unseen_total / unseen_quantity) if unseen_quantity != 0 else "") + " with quantity " + str(unseen_quantity))
+    print("Seen Binoculars Average: " + (str(seen_total / seen_quantity) if seen_quantity != 0 else "") + " with quantity " + str(seen_quantity))
+    print("Seen Mink Average: " + (str(seen_mink / seen_quantity) if seen_quantity != 0 else "") + " with quantity " + str(seen_quantity))
+    print("Unseen Binoculars Average: " + (str(unseen_total / unseen_quantity) if unseen_quantity != 0 else "") + " with quantity " + str(unseen_quantity))
+    print("Seen Mink Average: " + (str(unseen_mink / unseen_quantity) if unseen_quantity != 0 else "") + " with quantity " + str(unseen_quantity))
 
 def merge_dataset(dataset):
     # Splitting the entries by label
@@ -309,19 +336,45 @@ def merge_dataset(dataset):
 
     return merged_dataset
 
+import numpy as np
 
-from datasets import load_dataset
+def compute_min_k_probabilities(all_prob, ratio):
+    results = {}
+    total_tokens = len(all_prob)
+    k_length = int(total_tokens * ratio)  # Number of probabilities to consider
+    if k_length == 0:
+        raise ValueError("Ratio too small, resulting in zero tokens being considered.")
+    topk_prob = np.sort(all_prob)[:k_length]  # Get the smallest k probabilities
+    mean_topk_prob = -np.mean(topk_prob).item()  # Compute the negative mean of these probabilities
+    return mean_topk_prob
 
-dataset = load_dataset("swj0419/BookMIA")
-check_wikimia_dataset(dataset['train'])
+
+
+# Processing Work:
+
+# Retrieve Models from Cache
+drive.mount('/content/drive')
+cache_directory = "/content/drive/My Drive/transformers_cache/"
+
+#Checking Vulnerable Texts
+file_path = '/content/drive/My Drive/gdrive_datasets/vulnerable_texts.csv'
+df = pd.read_csv(file_path)
+
+for example in df:
+    print("Text Name " + example['Text Name'])
+    print("Text " + example['Text'])
+
+
+# Create a Binoculars Object
+binoculars = Binoculars(cache_dir=cache_directory)
+
+for example in df:
+    print("Text Name " + example['Text Name'])
+    print(binoculars.compute_score(example['Text']))
 
 
 
-
-print("Retrieving dataset...")
-LENGTH = 128
+LENGTH = 256
 dataset = load_dataset("swj0419/WikiMIA", split=f"WikiMIA_length{LENGTH}")
-merged = merge_dataset(dataset)
-
-check_wikimia_dataset(merged)
+check_wikimia_dataset(dataset)
 
