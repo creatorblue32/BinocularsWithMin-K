@@ -16,7 +16,7 @@ This project (Binoculars with Min-K%) was created to deal with the a key weaknes
 
 There is a growing body of research aimed at detecting memorized pre-training data in the output logits of LLMs. The work we implement here is a 2023 paper that focuses on the problem. The researchers introduce a dataset to benchmark this task as well as propose and test a solution called Min-K Probability. 
 
-In this project, we've determined the best Min-K probability ratio and threshold for the Falcon 7b model (used as the default observer in the original Binoculars implementation). Then, we introduce a stage in binoculars to check for memorized text using this threshold. If the original model deems a text "AI-Generated", it will trigger a Min-5% Probability check. If this check comes back below the threshold, the system will decline to classify the text. 
+In this project, we've determined the best Min-K probability ratio and threshold for the Falcon 7b model (used as the default observer in the original Binoculars implementation). Then, we introduce a stage in binoculars to check for memorized text using this threshold. If the original model deems a text "AI-Generated", it will trigger a Min-5% Probability check. If this check comes back below the threshold (indicating the model has likely seen the text during pre-training), the system will decline to classify the text. 
 
 ## Works Cited:
 
