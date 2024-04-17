@@ -161,7 +161,7 @@ class Binoculars(object):
         # Now compute min-k probabilities
         min_k_probs = self.min_k_probabilities(observer_logits, encodings)
 
-        return binoculars_scores[0], min_k_probs
+        return binoculars_scores, min_k_probs
     
     def compute_score_and_min_k(self, input_text, min_k_ratio, min_k_threshold):
         batch = [input_text] if isinstance(input_text, str) else input_text
